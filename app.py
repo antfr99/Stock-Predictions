@@ -63,6 +63,14 @@ st.markdown(
           background-color: #ffffff;
       }
       [data-testid="stSidebar"] { border-right: 1px solid #e6e6e6; }
+      [data-testid="stSidebar"] button[kind="secondary"] {
+          background-color: #f0f0f0;
+          border-color: #dcdcdc;
+      }
+      [data-testid="stSidebar"] button[kind="secondary"]:hover {
+          background-color: #e6e6e6;
+          border-color: #c9c9c9;
+      }
       .block-container { padding-top: 2.2rem; max-width: 1500px; }
       h1, h2, h3 { color: #111111; letter-spacing: -0.01em; }
       [data-testid="stMetricValue"] { font-size: 1.45rem; }
@@ -106,6 +114,8 @@ MAX_THRESHOLD_PCT        = 20.0
 
 HISTORY_YEARS = 6               # 6y so the 200-week MA can populate
 MAX_WORKERS   = 4
+
+DEFAULT_NEWSAPI_KEY = "210ba50713b74c3e900a5154d843c11e"
 
 _DIRECTION_ARROWS = {"Up": "🔼 Up", "Down": "🔽 Down", "Flat": "➡️ Flat"}
 
@@ -1043,7 +1053,7 @@ with st.sidebar:
     api_key = get_api_key()
     if not api_key:
         api_key = st.text_input(
-            "NewsAPI key", type="password",
+            "NewsAPI key", type="password", value=DEFAULT_NEWSAPI_KEY,
             help="Set NEWSAPI_KEY in secrets to skip this. "
                  "Without a key the app still runs — sentiment scores 0.",
         ).strip()
@@ -1087,9 +1097,15 @@ market_data, names = fetch_market_data(tickers)
 missing = [t for t in tickers if t not in market_data]
 if not market_data:
     progress.empty()
+    # Don't let a transient fetch failure (e.g. Yahoo Finance rate-limiting)
+    # sit cached as "no data" for the full TTL — clear it so the next click
+    # actually retries instead of replaying the same stale empty result.
+    fetch_market_data.clear()
     st.error(
-        "No price data came back for any of those symbols. Check the spelling — "
-        "international listings need their exchange suffix (e.g. 2330.TW, ASML.AS)."
+        "No price data came back for any of those symbols. This is usually a "
+        "temporary Yahoo Finance hiccup — click **Run predictions** again. "
+        "If it keeps happening, check the spelling — international listings "
+        "need their exchange suffix (e.g. 2330.TW, ASML.AS)."
     )
     st.stop()
 
