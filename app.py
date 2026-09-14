@@ -75,6 +75,31 @@ st.markdown(
       h1, h2, h3 { color: #111111; letter-spacing: -0.01em; }
       [data-testid="stMetricValue"] { font-size: 1.45rem; }
       div[data-testid="stDataFrame"] { border: 1px solid #ececec; border-radius: 4px; }
+
+      /* ── Filter controls: light grey fields ───────────────────── */
+      .stMultiSelect div[data-baseweb="select"] > div,
+      .stSelectbox  div[data-baseweb="select"] > div,
+      [data-testid="stMultiSelect"] div[data-baseweb="select"] > div,
+      [data-testid="stSelectbox"]  div[data-baseweb="select"] > div,
+      [data-testid="stTextInput"]  div[data-baseweb="input"],
+      [data-testid="stTextInput"]  input {
+          background-color: #f2f2f2 !important;
+          border-color: #dcdcdc !important;
+      }
+      /* the dropdown menu itself */
+      div[data-baseweb="popover"] ul[role="listbox"] {
+          background-color: #f7f7f7;
+      }
+      /* selected-value chips in a multiselect */
+      .stMultiSelect span[data-baseweb="tag"],
+      [data-testid="stMultiSelect"] span[data-baseweb="tag"] {
+          background-color: #e2e2e2 !important;
+          color: #222222 !important;
+      }
+      .stMultiSelect span[data-baseweb="tag"] svg,
+      [data-testid="stMultiSelect"] span[data-baseweb="tag"] svg {
+          fill: #444444 !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -897,7 +922,7 @@ def fetch_news(tickers: tuple, api_key: str, names: dict):
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def build_predictions(cache_key: tuple, _market_data: dict, _names: dict,
-                      _news_df: pd.DataFrame, _progress=None):
+                      _news_df: pd.DataFrame):
     """
     Run the walk-forward model per ticker, attach sentiment, score the
     3-point signal, and return the next-week (Set == 'Future') rows.
@@ -906,8 +931,14 @@ def build_predictions(cache_key: tuple, _market_data: dict, _names: dict,
     ticker), so the result is cached on `cache_key`. Underscore-prefixed
     arguments are passed through without being hashed — Streamlit skips
     them — which keeps the key cheap instead of fingerprinting every frame.
+
+    IMPORTANT: nothing in here may write to the page. A cached function
+    records any Streamlit element it emits and replays those on a cache
+    hit; an element that captured a live widget handle (the old progress
+    bar) can't be replayed and raises CacheReplayClosureError. Progress is
+    therefore reported by the caller, outside the cache.
     """
-    market_data, names, news_df, progress = _market_data, _names, _news_df, _progress
+    market_data, names, news_df = _market_data, _names, _news_df
 
     if not news_df.empty:
         ticker_sentiments = news_df.groupby("Ticker")["Score"].mean().to_dict()
@@ -916,12 +947,8 @@ def build_predictions(cache_key: tuple, _market_data: dict, _names: dict,
         ticker_sentiments, headline_counts = {}, {}
 
     rows, full_frames = [], []
-    total = max(len(market_data), 1)
 
-    for idx, (t, df) in enumerate(market_data.items(), start=1):
-        if progress:
-            progress.progress(idx / total, text=f"Training walk-forward model — {t}")
-
+    for t, df in market_data.items():
         try:
             df_pred = train_predict_xgboost_filtered(df)
             if "Set" not in df_pred.columns or (df_pred["Set"] == "Future").sum() == 0:
@@ -1122,9 +1149,9 @@ cache_key = (
          for d in market_data.values()), default=""),
 )
 
-df_display, df_full = build_predictions(
-    cache_key, market_data, names, news_df, progress
-)
+progress.progress(0.5, text="Training walk-forward models…")
+df_display, df_full = build_predictions(cache_key, market_data, names, news_df)
+progress.progress(1.0, text="Done")
 progress.empty()
 
 if missing:
