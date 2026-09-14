@@ -1,0 +1,9 @@
+streamlit>=1.32
+pandas
+numpy
+matplotlib
+requests
+yfinance
+xgboost
+ta
+nltk
