@@ -7,3 +7,4 @@ yfinance>=0.2.40
 xgboost>=2.0
 ta>=0.11
 nltk>=3.8
+sklearn
