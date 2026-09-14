@@ -145,8 +145,6 @@ plt.rcParams.update({
 # 1.  Configuration (same constants as the original app)
 # ══════════════════════════════════════════════════════════════════
 
-DEFAULT_TICKERS = ["NVDA", "AMD", "TSM", "AVGO", "ASML"]
-
 CORRECT_THRESHOLD = 0.02        # used by the walk-forward hit-rate stat
 MIN_TRAIN_SIZE    = 50          # min weekly rows before the model will train
 
@@ -904,11 +902,24 @@ def plot_expected_move(df_display: pd.DataFrame) -> plt.Figure:
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
 
+    # Explicit, padded y-limits: with an all-negative (or single-bar) series
+    # matplotlib's autoscale hugs the bar tips so tightly that a label
+    # placed just outside the bar lands on top of the x-axis tick labels
+    # (the ticker names) below it. Reserve headroom on the sparse side too,
+    # so a lone bar isn't the entire plot.
+    vmax, vmin = max(vals.max(), 0.0), min(vals.min(), 0.0)
+    span = max(vmax - vmin, 1.0)
+    pad = span * 0.22
+    ax.set_ylim(vmin - pad, vmax + pad)
+
+    label_gap = span * 0.04
     for rect, val in zip(bars, vals):
-        offset = 0.06 * max(abs(vals.max()), abs(vals.min()), 1)
-        ax.text(rect.get_x() + rect.get_width() / 2,
-                val + (offset if val >= 0 else -offset * 1.8),
-                f"{val:+.2f}%", ha="center", va="bottom", fontsize=9)
+        if val >= 0:
+            y, va = val + label_gap, "bottom"
+        else:
+            y, va = val - label_gap, "top"
+        ax.text(rect.get_x() + rect.get_width() / 2, y,
+                f"{val:+.2f}%", ha="center", va=va, fontsize=9)
 
     fig.tight_layout()
     return fig
@@ -1115,47 +1126,52 @@ def get_api_key() -> str:
 
 
 if "tickers" not in st.session_state:
-    st.session_state.tickers = DEFAULT_TICKERS.copy()
+    st.session_state.tickers = []
+
+# The add-ticker text box is cleared after every Apply by giving it a fresh
+# widget key (Streamlit won't let a script reset a widget's own key directly
+# once it has been instantiated).
+if "ticker_input_key" not in st.session_state:
+    st.session_state.ticker_input_key = 0
+
+
+def _add_tickers():
+    raw = st.session_state.get(f"ticker_add_{st.session_state.ticker_input_key}", "")
+    for part in raw.split(","):
+        c = clean_ticker(part)
+        if c and c not in st.session_state.tickers:
+            st.session_state.tickers.append(c)
+    # Bump the key so the text box redraws empty next run.
+    st.session_state.ticker_input_key += 1
+
 
 with st.sidebar:
     st.markdown("### Tickers")
-    st.caption("Type any symbol — nothing is restricted to a preset list.")
+    st.caption("Add one or more symbols, comma-separated, then Apply.")
 
-    # Streamlit ≥1.45 lets a multiselect accept free-text entries. Older
-    # versions fall back to a comma-separated text box so the app still runs.
-    import inspect
-    supports_new_options = (
-        "accept_new_options" in inspect.signature(st.multiselect).parameters
+    st.text_input(
+        "Add tickers",
+        placeholder="e.g. NVDA, AMD, 2330.TW",
+        label_visibility="collapsed",
+        key=f"ticker_add_{st.session_state.ticker_input_key}",
+        on_change=_add_tickers,
     )
+    st.button("Apply", use_container_width=True, on_click=_add_tickers)
 
-    if supports_new_options:
-        chosen = st.multiselect(
-            "Ticker list",
-            options=sorted(set(st.session_state.tickers) | set(DEFAULT_TICKERS)),
+    if st.session_state.tickers:
+        kept = st.multiselect(
+            "Current tickers — remove with ×",
+            options=st.session_state.tickers,
             default=st.session_state.tickers,
-            accept_new_options=True,
             label_visibility="collapsed",
-            help="Start typing to add a symbol that isn't listed yet.",
         )
+        st.session_state.tickers = kept
+
+        if st.button("Clear all", use_container_width=True):
+            st.session_state.tickers = []
+            st.rerun()
     else:
-        raw = st.text_input(
-            "Ticker list",
-            value=", ".join(st.session_state.tickers),
-            label_visibility="collapsed",
-            help="Comma-separated, e.g. NVDA, AMD, 2330.TW",
-        )
-        chosen = raw.split(",")
-
-    tickers = []
-    for t in chosen:
-        c = clean_ticker(t)
-        if c and c not in tickers:
-            tickers.append(c)
-    st.session_state.tickers = tickers or DEFAULT_TICKERS.copy()
-
-    if st.button("Reset to defaults", use_container_width=True):
-        st.session_state.tickers = DEFAULT_TICKERS.copy()
-        st.rerun()
+        st.info("No tickers added yet.")
 
     st.divider()
     st.markdown("### News")
@@ -1188,13 +1204,24 @@ st.caption(
 )
 
 if run:
-    st.session_state.has_run = True
+    if st.session_state.tickers:
+        st.session_state.has_run = True
+    else:
+        st.session_state.has_run = False
+
+if not st.session_state.tickers:
+    st.info(
+        "Add at least one ticker in the sidebar — type a symbol (or several, "
+        "comma-separated) and choose **Apply** — then **Run predictions**."
+    )
+    st.stop()
 
 if not st.session_state.get("has_run"):
     st.info(
-        f"Ready with {len(st.session_state.tickers)} tickers: "
+        f"Ready with {len(st.session_state.tickers)} ticker"
+        f"{'s' if len(st.session_state.tickers) != 1 else ''}: "
         f"{', '.join(st.session_state.tickers)}. "
-        "Edit the list in the sidebar, then choose **Run predictions**."
+        "Choose **Run predictions** in the sidebar."
     )
     st.stop()
 
