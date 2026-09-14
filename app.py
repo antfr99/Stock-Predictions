@@ -76,29 +76,48 @@ st.markdown(
       [data-testid="stMetricValue"] { font-size: 1.45rem; }
       div[data-testid="stDataFrame"] { border: 1px solid #ececec; border-radius: 4px; }
 
-      /* ── Filter controls: light grey fields ───────────────────── */
-      .stMultiSelect div[data-baseweb="select"] > div,
-      .stSelectbox  div[data-baseweb="select"] > div,
-      [data-testid="stMultiSelect"] div[data-baseweb="select"] > div,
-      [data-testid="stSelectbox"]  div[data-baseweb="select"] > div,
-      [data-testid="stTextInput"]  div[data-baseweb="input"],
-      [data-testid="stTextInput"]  input {
+      /* ── Filter controls: light grey fields ─────────────────────
+         Selectors are deliberately broad (no Streamlit wrapper class):
+         the testid/class names around widgets change between releases,
+         but the BaseWeb data-attributes underneath have been stable. */
+
+      /* select + multiselect field, and text/password inputs */
+      div[data-baseweb="select"] > div,
+      div[data-baseweb="input"],
+      div[data-baseweb="base-input"],
+      div[data-baseweb="input"] input,
+      [data-testid="stTextInput"] input,
+      [data-testid="stNumberInput"] input,
+      [data-testid="stDateInput"] div[data-baseweb="input"] {
           background-color: #f2f2f2 !important;
           border-color: #dcdcdc !important;
       }
-      /* the dropdown menu itself */
-      div[data-baseweb="popover"] ul[role="listbox"] {
-          background-color: #f7f7f7;
+
+      /* selected-value chips — grey instead of the theme's red */
+      span[data-baseweb="tag"],
+      span[data-baseweb="tag"]:hover {
+          background-color: #e4e4e4 !important;
+          border: 1px solid #d5d5d5 !important;
+          color: #1f1f1f !important;
       }
-      /* selected-value chips in a multiselect */
-      .stMultiSelect span[data-baseweb="tag"],
-      [data-testid="stMultiSelect"] span[data-baseweb="tag"] {
-          background-color: #e2e2e2 !important;
-          color: #222222 !important;
+      span[data-baseweb="tag"] span,
+      span[data-baseweb="tag"] div {
+          color: #1f1f1f !important;
       }
-      .stMultiSelect span[data-baseweb="tag"] svg,
-      [data-testid="stMultiSelect"] span[data-baseweb="tag"] svg {
-          fill: #444444 !important;
+      span[data-baseweb="tag"] svg,
+      span[data-baseweb="tag"] path {
+          fill: #555555 !important;
+          color: #555555 !important;
+      }
+
+      /* dropdown menu that opens below a filter */
+      div[data-baseweb="popover"] ul[role="listbox"],
+      div[data-baseweb="popover"] div[role="listbox"],
+      div[data-baseweb="menu"] {
+          background-color: #f7f7f7 !important;
+      }
+      div[data-baseweb="popover"] li[role="option"]:hover {
+          background-color: #e8e8e8 !important;
       }
     </style>
     """,
@@ -393,11 +412,45 @@ def compute_volatility_threshold(
 # 3.  Weekly dataset builder
 # ══════════════════════════════════════════════════════════════════
 
+def _fetch_daily_history(stock, start_date, end_date) -> pd.DataFrame:
+    """
+    Daily OHLCV for one ticker.
+
+    Yahoo sometimes answers a start/end request with a truncated frame when
+    it is throttling, which silently starves the model of history. If the
+    first answer looks short, ask again by period — a different code path on
+    Yahoo's side — and keep whichever came back longer.
+    """
+    try:
+        hist = _retry(lambda: stock.history(start=start_date, end=end_date))
+        hist = _normalize_yf_columns(hist)
+    except Exception:
+        hist = pd.DataFrame()
+
+    # ~250 trading days a year; anything under 2 years of dailies is suspect.
+    if len(hist) < 500:
+        try:
+            alt = _retry(lambda: stock.history(period=f"{HISTORY_YEARS}y"))
+            alt = _normalize_yf_columns(alt)
+            if len(alt) > len(hist):
+                hist = alt
+        except Exception:
+            pass
+
+    return hist
+
+
 def compute_weekly_ml_data_with_target(ticker_list):
-    """Weekly OHLCV + features + next-week target, per ticker."""
+    """
+    Weekly OHLCV + features + next-week target, per ticker.
+
+    Returns (all_data, names, diag). `diag` records why a ticker produced
+    nothing usable — without it a throttled download looks identical to a
+    genuinely short listing history.
+    """
     end_date = datetime.today()
     start_date = end_date - timedelta(days=HISTORY_YEARS * 365)
-    all_data, names = {}, {}
+    all_data, names, diag = {}, {}, {}
 
     for ticker in ticker_list:
         try:
@@ -413,9 +466,9 @@ def compute_weekly_ml_data_with_target(ticker_list):
                     or (isinstance(trailing_eps, float) and np.isnan(trailing_eps))):
                 trailing_eps = 1.0
 
-            hist = _retry(lambda: stock.history(start=start_date, end=end_date))
-            hist = _normalize_yf_columns(hist)
+            hist = _fetch_daily_history(stock, start_date, end_date)
             if hist.empty:
+                diag[ticker] = "Yahoo returned no daily price rows"
                 continue
             if hist.index.tz is not None:
                 hist.index = hist.index.tz_convert(None)
@@ -426,7 +479,16 @@ def compute_weekly_ml_data_with_target(ticker_list):
             }).dropna(subset=["Close"])
 
             if weekly.empty:
+                diag[ticker] = "daily rows present but weekly resample was empty"
                 continue
+
+            # One row is consumed by the forward-shifted target, so the model
+            # sees len(weekly) - 1 trainable weeks.
+            if len(weekly) - 1 < MIN_TRAIN_SIZE:
+                diag[ticker] = (
+                    f"only {len(weekly)} weekly rows came back "
+                    f"({len(hist)} daily) — needs {MIN_TRAIN_SIZE + 1}"
+                )
 
             beta_val = _compute_beta(weekly["Close"], start_date, end_date)
             if np.isnan(beta_val):
@@ -452,12 +514,21 @@ def compute_weekly_ml_data_with_target(ticker_list):
                 (weekly["Target_Close_1w"] - weekly["Close"]) / weekly["Close"]
             )
             weekly["Ticker"] = ticker
-            all_data[ticker] = weekly.reset_index()
+            frame = weekly.reset_index()
 
-        except Exception:
+            # Whatever the datetime index was called, the model and the
+            # cache key both expect a plain "Date" column.
+            if "Date" not in frame.columns:
+                first = frame.columns[0]
+                frame = frame.rename(columns={first: "Date"})
+
+            all_data[ticker] = frame
+
+        except Exception as exc:
+            diag[ticker] = f"{type(exc).__name__}: {exc}"
             continue
 
-    return all_data, names
+    return all_data, names, diag
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -872,7 +943,7 @@ def plot_price_history(df_hist: pd.DataFrame, ticker: str, weeks: int = 104) -> 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_market_data(tickers: tuple):
     """Weekly OHLCV + features for each ticker, fetched in parallel."""
-    data, names = {}, {}
+    data, names, diag = {}, {}, {}
 
     def _one(t):
         return compute_weekly_ml_data_with_target([t])
@@ -882,14 +953,16 @@ def fetch_market_data(tickers: tuple):
         for fut in as_completed(futures):
             t = futures[fut]
             try:
-                d, n = fut.result()
+                d, n, g = fut.result()
                 if t in d and not d[t].empty:
                     data[t] = d[t]
                 names.update(n)
-            except Exception:
+                diag.update(g)
+            except Exception as exc:
+                diag[t] = f"{type(exc).__name__}: {exc}"
                 continue
 
-    return data, names
+    return data, names, diag
 
 
 @st.cache_data(ttl=30 * 60, show_spinner=False)
@@ -946,12 +1019,20 @@ def build_predictions(cache_key: tuple, _market_data: dict, _names: dict,
     else:
         ticker_sentiments, headline_counts = {}, {}
 
-    rows, full_frames = [], []
+    rows, full_frames, skips = [], [], {}
 
     for t, df in market_data.items():
         try:
+            trainable = int(df["Target_Return_1w"].notna().sum())
             df_pred = train_predict_xgboost_filtered(df)
+
             if "Set" not in df_pred.columns or (df_pred["Set"] == "Future").sum() == 0:
+                if trainable < MIN_TRAIN_SIZE:
+                    skips[t] = (f"{trainable} trainable weeks of history "
+                                f"(needs {MIN_TRAIN_SIZE})")
+                else:
+                    skips[t] = ("no forecastable row — the latest week already "
+                                "has a next-week close attached")
                 continue
 
             sentiment = ticker_sentiments.get(t, 0.0)
@@ -1005,7 +1086,8 @@ def build_predictions(cache_key: tuple, _market_data: dict, _names: dict,
                 **stats,
             })
 
-        except Exception:
+        except Exception as exc:
+            skips[t] = f"{type(exc).__name__}: {exc}"
             continue
 
     df_display = pd.DataFrame(rows)
@@ -1016,7 +1098,7 @@ def build_predictions(cache_key: tuple, _market_data: dict, _names: dict,
 
     df_full = (pd.concat(full_frames, ignore_index=True)
                if full_frames else pd.DataFrame())
-    return df_display, df_full
+    return df_display, df_full, skips
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1119,7 +1201,7 @@ if not st.session_state.get("has_run"):
 tickers = tuple(st.session_state.tickers)
 
 progress = st.progress(0.0, text="Downloading weekly price history…")
-market_data, names = fetch_market_data(tickers)
+market_data, names, fetch_diag = fetch_market_data(tickers)
 
 missing = [t for t in tickers if t not in market_data]
 if not market_data:
@@ -1134,6 +1216,10 @@ if not market_data:
         "If it keeps happening, check the spelling — international listings "
         "need their exchange suffix (e.g. 2330.TW, ASML.AS)."
     )
+    if fetch_diag:
+        with st.expander("Per-ticker detail"):
+            st.markdown("\n".join(f"- **{t}** — {r}"
+                                  for t, r in sorted(fetch_diag.items())))
     st.stop()
 
 progress.progress(0.25, text="Fetching news headlines…")
@@ -1150,19 +1236,56 @@ cache_key = (
 )
 
 progress.progress(0.5, text="Training walk-forward models…")
-df_display, df_full = build_predictions(cache_key, market_data, names, news_df)
+df_display, df_full, skips = build_predictions(cache_key, market_data, names, news_df)
 progress.progress(1.0, text="Done")
 progress.empty()
 
 if missing:
     st.warning("No data for: " + ", ".join(missing))
 
+
+def _reason_lines() -> list:
+    """One line per ticker that produced no forecast, and why."""
+    out = []
+    for t in tickers:
+        reason = skips.get(t) or fetch_diag.get(t)
+        if reason:
+            out.append(f"- **{t}** — {reason}")
+        elif t not in market_data:
+            out.append(f"- **{t}** — no price data returned")
+    return out
+
+
 if df_display.empty:
-    st.error(
-        f"Price data loaded, but no ticker had the {MIN_TRAIN_SIZE} weeks of "
-        "history the model needs. Try longer-listed symbols."
-    )
+    st.error("No ticker produced a forecast.")
+
+    lines = _reason_lines()
+    if lines:
+        st.markdown("**What happened per ticker**\n\n" + "\n".join(lines))
+
+    weekly_counts = {t: len(d) for t, d in market_data.items()}
+    if weekly_counts and max(weekly_counts.values()) <= MIN_TRAIN_SIZE:
+        st.info(
+            "Every download came back short, which for long-listed symbols "
+            "like these almost always means Yahoo Finance is throttling this "
+            "app rather than the history being genuinely missing. Click "
+            "**Clear cache**, wait a minute, then **Run predictions** again."
+        )
+        # Don't let a throttled fetch sit cached for the full hour.
+        fetch_market_data.clear()
+
+    with st.expander("Weekly rows downloaded per ticker"):
+        st.write(weekly_counts)
+
     st.stop()
+
+if skips:
+    st.warning(
+        "Skipped " + ", ".join(sorted(skips)) + " — "
+        "open the detail below for the reason."
+    )
+    with st.expander("Why those tickers were skipped"):
+        st.markdown("\n".join(_reason_lines()))
 
 # ── Header metrics ────────────────────────────────────────────────
 target_friday = df_display["Target_Friday"].mode().iloc[0]
